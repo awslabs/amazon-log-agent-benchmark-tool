@@ -21,40 +21,34 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"os"
 	"time"
 )
 
-const timeFormat = time.StampNano
+type Opt func(g *Generator)
 
-type Generator struct {
-	dest   io.Writer
-	rate   float64
-	buf    []string
-	idx    int
-	done   chan struct{}
-	rateCh chan float64
+func OptTimeLayout(tf string) func(g *Generator) {
+	return func(g *Generator) {
+		g.timeFormat = tf
+	}
+}
 
-	rand *rand.Rand
+func OptRate(rate float64) func(g *Generator) {
+	return func(g *Generator) {
+		g.rate = rate
+	}
+}
+
+func OptLines(lines []string) func(g *Generator) {
+	return func(g *Generator) {
+		g.buf = lines
+	}
 }
 
 type Generators []*Generator
-
-func NewFixed(line string, logfiles []string) (Generators, error) {
-	var gens Generators
-	for _, path := range logfiles {
-		out, err := os.Create(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create log file at %v with error: %v", path, err)
-		}
-		gen := NewFixedGenerator(line, out, 0)
-		gen.Start()
-		gens = append(gens, gen)
-	}
-	return gens, nil
-}
 
 func (gs Generators) SetRate(r float64) {
 	for _, gen := range gs {
@@ -68,7 +62,16 @@ func (gs Generators) Stop() {
 	}
 }
 
-func NewGeneratorFromFile(path string, dest io.Writer, rate float64) (*Generator, error) {
+func NewFixed(line string, dests []io.Writer, opts ...Opt) Generators {
+	var gens Generators
+	opts = append(opts, OptLines([]string{line}))
+	for _, dest := range dests {
+		gens = append(gens, newGenerator(dest, opts...))
+	}
+	return gens
+}
+
+func NewGeneratorFromFile(path string, dest io.Writer, opts ...Opt) (*Generator, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -84,20 +87,39 @@ func NewGeneratorFromFile(path string, dest io.Writer, rate float64) (*Generator
 	if err != nil {
 		return nil, err
 	}
+	opts = append(opts, OptLines(lines))
 
-	return &Generator{buf: lines, dest: dest, rate: rate, done: make(chan struct{}), rateCh: make(chan float64)}, nil
+	return newGenerator(dest, opts...), nil
 }
 
-func NewFixedGenerator(line string, dest io.Writer, rate float64) *Generator {
+type Generator struct {
+	dest           io.Writer
+	rate           float64
+	buf            []string
+	idx            int
+	done           chan struct{}
+	rateCh         chan float64
+	timeFormat     string
+	rotateSize     int64
+	rotateDuratoin time.Duration
+
+	rand *rand.Rand
+}
+
+func newGenerator(dest io.Writer, opts ...Opt) *Generator {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return &Generator{
-		buf:    []string{line},
-		dest:   dest,
-		rate:   rate,
-		done:   make(chan struct{}),
-		rateCh: make(chan float64),
-		rand:   r,
+	g := &Generator{
+		dest:       dest,
+		done:       make(chan struct{}),
+		rateCh:     make(chan float64),
+		rand:       r,
+		timeFormat: time.StampNano,
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	g.Start()
+	return g
 }
 
 func (g *Generator) SetRate(r float64) {
@@ -113,9 +135,11 @@ func (g *Generator) Start() {
 			select {
 			case now := <-t.C:
 				for {
-					d := g.timeBetweenLine()
-					fmt.Fprintf(g.dest, "%v %s\n", now.Format(timeFormat), g.nextLine())
-					tn = tn.Add(d)
+					tn = tn.Add(g.delay())
+					_, err := fmt.Fprintf(g.dest, "%v %s\n", now.Format(g.timeFormat), g.nextLine())
+					if err != nil {
+						log.Printf("Failed to write to %v with error: %v", g.dest, err)
+					}
 					if tn.After(now) {
 						t.Reset(tn.Sub(now))
 						break
@@ -138,7 +162,7 @@ func (g *Generator) Stop() {
 	g.done <- struct{}{}
 }
 
-func (g *Generator) timeBetweenLine() time.Duration {
+func (g *Generator) delay() time.Duration {
 	if g.rate == 0 {
 		return time.Duration(math.MaxInt64)
 	}

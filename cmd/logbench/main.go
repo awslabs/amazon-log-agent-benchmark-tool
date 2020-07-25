@@ -20,6 +20,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/awslabs/amazon-log-agent-benchmark-tool/generator"
 	"github.com/awslabs/amazon-log-agent-benchmark-tool/resource"
+	"github.com/awslabs/amazon-log-agent-benchmark-tool/rotator"
 )
 
 const (
@@ -56,14 +58,22 @@ var Usage = func() {
 
 func main() {
 	var logfiles, rateStrs MultpleValueFlag
-	var tLength, rampUp, freq time.Duration
-	var pid int
-	flag.Var(&logfiles, "log", "Path of the log files being generated and writes logs to, you can specify multiple values by using the parameter multiple times or use comma seperated list.")
+	var tLength, rampUp, freq, rotateDuration time.Duration
+	var timeLayout, logLine, rotateSizeStr string
+	var pid, rotateKeep int
+	flag.Var(&logfiles, "log", "Path of the log files being generated and writes logs to, you can specify multiple values by using the parameter multiple times or use comma seperated list")
 	flag.Var(&rateStrs, "rate", "Log generation rate to be tested, e.g. -log 1,100,1k,10k,100k, default 100")
 	flag.IntVar(&pid, "p", noPid, "Pid of the agent to check resource usage")
+	flag.StringVar(&timeLayout, "timelayout", "Jan _2 15:04:05.000000000", "Format to print the timestamp for the log lines, following Go time layout, see: https://golang.org/pkg/time/#pkg-constants")
+	flag.StringVar(&logLine, "line", FixedLogLine, "Content of the log line to be used")
 	flag.DurationVar(&tLength, "t", 10*time.Second, "Test duration, in format supported by time.ParseDuration, default 10s")
 	flag.DurationVar(&rampUp, "r", 1*time.Second, "Ramp up duration, time for agent to stablize, stats will not be collected during the ramp up, default 1s")
 	flag.DurationVar(&freq, "f", 1*time.Second, "Frequency to collect metrics represented in time duration, default 1s")
+
+	flag.IntVar(&rotateKeep, "rotatekeep", 0, "Number of rotation files to keep, 0 to disable rotation")
+	flag.StringVar(&rotateSizeStr, "rotatesize", "", "Size of the logfile before rotation")
+	flag.DurationVar(&rotateDuration, "rotatetime", 0, "How much time the logfile should be rotated")
+
 	flag.Parse()
 
 	if len(logfiles) == 0 {
@@ -82,10 +92,29 @@ func main() {
 		rates = []float64{100}
 	}
 
-	gens, err := generator.NewFixed(FixedLogLine, logfiles)
+	rsize, err := parseNumber(rotateSizeStr)
 	if err != nil {
-		log.Fatalf("Failed to create generators: %v", err)
+		log.Printf("Unable to parse rate param: %v", err)
+		Usage()
+		os.Exit(1)
 	}
+	rconf := rotator.Config{
+		Keep:     rotateKeep,
+		Duration: rotateDuration,
+		Size:     int64(rsize),
+	}
+
+	var opts []generator.Opt
+	if timeLayout != "" {
+		opts = append(opts, generator.OptTimeLayout(timeLayout))
+	}
+
+	files, err := createLogFiles(logfiles, rconf)
+	if err != nil {
+		log.Fatalf("Failed to create logfiles: %v", err)
+	}
+
+	gens := generator.NewFixed(logLine, files, opts...)
 
 	args := flag.Args()
 	var cmd *exec.Cmd
@@ -162,6 +191,18 @@ func main() {
 	}
 }
 
+func createLogFiles(paths []string, rconf rotator.Config) ([]io.Writer, error) {
+	var ws []io.Writer
+	for _, path := range paths {
+		w, err := rotator.NewWriter(rotator.NewFileRotator(path, rconf.Keep), rconf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create file %v: %w", path, err)
+		}
+		ws = append(ws, w)
+	}
+	return ws, nil
+}
+
 func startAgent(c string, args []string) (*exec.Cmd, error) {
 	cmd := exec.Command(c, args...)
 	if err := cmd.Start(); err != nil {
@@ -184,29 +225,40 @@ func stopAgent(cmd *exec.Cmd) {
 func parseRates(strs []string) ([]float64, error) {
 	var result []float64
 	for _, str := range strs {
-		str = strings.ToLower(str)
-		lb := str[len(str)-1]
-		if lb < '0' || lb > '9' {
-			str = str[:len(str)-1]
-		}
-		n, err := strconv.ParseFloat(str, 64)
+		n, err := parseNumber(str)
 		if err != nil {
-			return nil, fmt.Errorf("Invalid rate value %v", str)
-		}
-
-		switch lb {
-		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			n = n
-		case 'k':
-			n *= 1000
-		case 'm':
-			n *= 1000 * 1000
-		case 'g':
-			n *= 1000 * 1000 * 1000
-		default:
-			return nil, fmt.Errorf("Unsupported unit '%c' for rate", lb)
+			return nil, err
 		}
 		result = append(result, n)
 	}
 	return result, nil
+}
+
+func parseNumber(str string) (float64, error) {
+	str = strings.TrimSpace(strings.ToLower(str))
+	if len(str) == 0 {
+		return 0, nil
+	}
+	lb := str[len(str)-1]
+	if lb < '0' || lb > '9' {
+		str = str[:len(str)-1]
+	}
+	n, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return 0, fmt.Errorf("Invalid rate value %v", str)
+	}
+
+	switch lb {
+	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		n = n
+	case 'k':
+		n *= 1000
+	case 'm':
+		n *= 1000 * 1000
+	case 'g':
+		n *= 1000 * 1000 * 1000
+	default:
+		return 0, fmt.Errorf("Unsupported unit '%c' for rate", lb)
+	}
+	return n, nil
 }
