@@ -1,3 +1,3 @@
 module github.com/awslabs/amazon-log-agent-benchmark-tool
 
-go 1.12
+go 1.13

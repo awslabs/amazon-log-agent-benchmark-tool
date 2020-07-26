@@ -61,9 +61,11 @@ func main() {
 	var tLength, rampUp, freq, rotateDuration time.Duration
 	var timeLayout, logLine, rotateSizeStr string
 	var pid, rotateKeep int
+	var pipeOutput bool
 	flag.Var(&logfiles, "log", "Path of the log files being generated and writes logs to, you can specify multiple values by using the parameter multiple times or use comma seperated list")
 	flag.Var(&rateStrs, "rate", "Log generation rate to be tested, e.g. -log 1,100,1k,10k,100k, default 100")
 	flag.IntVar(&pid, "p", noPid, "Pid of the agent to check resource usage")
+	flag.BoolVar(&pipeOutput, "o", false, "Pipe agent output to stdout and stderr")
 	flag.StringVar(&timeLayout, "timelayout", "Jan _2 15:04:05.000000000", "Format to print the timestamp for the log lines, following Go time layout, see: https://golang.org/pkg/time/#pkg-constants")
 	flag.StringVar(&logLine, "line", FixedLogLine, "Content of the log line to be used")
 	flag.DurationVar(&tLength, "t", 10*time.Second, "Test duration, in format supported by time.ParseDuration, default 10s")
@@ -119,7 +121,7 @@ func main() {
 	args := flag.Args()
 	var cmd *exec.Cmd
 	if len(args) > 0 {
-		cmd, err = startAgent(args[0], args[1:])
+		cmd, err = startAgent(pipeOutput, args[0], args[1:])
 		if err != nil {
 			log.Fatalf("Failed to start agent with error: %v", err)
 		}
@@ -164,8 +166,9 @@ func main() {
 				if err != nil {
 					log.Fatalf("Failed to update resource usage: %v", err)
 				}
-				fmt.Printf("CPU: %.1f%% MEM: %v \n", p.CpuPercent(), p.MemoryHuman())
-				scpu += p.CpuPercent()
+				cpu := p.CpuPercent()
+				fmt.Printf("CPU: %.1f%% MEM: %v \n", cpu, p.MemoryHuman())
+				scpu += cpu
 				mbf := float64(p.Memory())
 				sres += mbf
 				if mres < mbf {
@@ -203,8 +206,24 @@ func createLogFiles(paths []string, rconf rotator.Config) ([]io.Writer, error) {
 	return ws, nil
 }
 
-func startAgent(c string, args []string) (*exec.Cmd, error) {
+func startAgent(pipeOutput bool, c string, args []string) (*exec.Cmd, error) {
 	cmd := exec.Command(c, args...)
+	if pipeOutput {
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			io.Copy(os.Stdout, stdout)
+		}()
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			io.Copy(os.Stderr, stderr)
+		}()
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to execute command %v with params %v, error: %v", args[0], args[1:], err)
 	}
