@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/awslabs/amazon-log-agent-benchmark-tool/generator"
+	"github.com/awslabs/amazon-log-agent-benchmark-tool/replayer"
 	"github.com/awslabs/amazon-log-agent-benchmark-tool/resource"
 	"github.com/awslabs/amazon-log-agent-benchmark-tool/rotator"
 )
@@ -59,13 +60,16 @@ var Usage = func() {
 func main() {
 	var logfiles, rateStrs MultpleValueFlag
 	var tLength, rampUp, freq, rotateDuration time.Duration
-	var timeLayout, logLine, rotateSizeStr string
+	var timeLayout, logLine, rotateSizeStr, replay, replayTimeLayout, multilineStart string
 	var pid, rotateKeep int
 	var pipeOutput bool
 	flag.Var(&logfiles, "log", "Path of the log files being generated and writes logs to, you can specify multiple values by using the parameter multiple times or use comma seperated list")
 	flag.Var(&rateStrs, "rate", "Log generation rate to be tested, e.g. -log 1,100,1k,10k,100k, default 100")
 	flag.IntVar(&pid, "p", noPid, "Pid of the agent to check resource usage")
 	flag.BoolVar(&pipeOutput, "o", false, "Pipe agent output to stdout and stderr")
+	flag.StringVar(&replay, "replay", "", "Path to a file for log replay")
+	flag.StringVar(&replayTimeLayout, "replaytimelayout", "", `Format to parse and replace the timestamp for replaying log file, e.g. -replayTimeLayout='Mon, 02 Jan 2006 15:04:05 MST', or use a capture group like -replaytimelayout='"timestamp":"(2006-01-02T15:04:05-0700)"' following Go time layout, see: https://golang.org/pkg/time/#pkg-constants`)
+	flag.StringVar(&multilineStart, "multilinestart", "", "Regular expression of a start of a multiline log event")
 	flag.StringVar(&timeLayout, "timelayout", "Jan _2 15:04:05.000000000", "Format to print the timestamp for the log lines, following Go time layout, see: https://golang.org/pkg/time/#pkg-constants")
 	flag.StringVar(&logLine, "line", FixedLogLine, "Content of the log line to be used")
 	flag.DurationVar(&tLength, "t", 10*time.Second, "Test duration, in format supported by time.ParseDuration, default 10s")
@@ -106,18 +110,12 @@ func main() {
 		Size:     int64(rsize),
 	}
 
-	var opts []generator.Opt
-	if timeLayout != "" {
-		opts = append(opts, generator.OptTimeLayout(timeLayout))
-	}
-
 	files, err := createLogFiles(logfiles, rconf)
 	if err != nil {
 		log.Fatalf("Failed to create logfiles: %v", err)
 	}
 
-	gens := generator.NewFixed(logLine, files, opts...)
-
+	// Start the agent if specified
 	args := flag.Args()
 	var cmd *exec.Cmd
 	if len(args) > 0 {
@@ -127,70 +125,103 @@ func main() {
 		}
 		pid = cmd.Process.Pid
 		fmt.Println("Agent running with PID: ", pid)
+		defer func() {
+			fmt.Println("Stopping the agent ...")
+			stopAgent(cmd)
+		}()
 	}
 
 	if pid == noPid {
 		fmt.Println("No agent command or agent pid given, just generating logs instead.")
 	}
 
-	for _, rate := range rates {
-		gens.SetRate(rate)
-		fmt.Printf("Ramping up for rate %v for %v ...\n", rate, rampUp)
-		time.Sleep(rampUp)
-		start := time.Now()
-		t := time.NewTicker(freq)
+	if replay != "" {
+		for _, wf := range files {
+			rf, err := os.Open(replay)
+			if err != nil {
+				log.Fatalf("Unable to open source file '%v' to replay, err: '%v'", replay, err)
+			}
 
-		var scpu, sres, mres float64
-		var n int
-		var p *resource.Process
-		if pid != noPid {
-			p, err = resource.FindProcess(pid)
-			if err != nil {
-				if len(args) > 0 {
-					log.Fatalf("Failed to find process for command %v with params %v, pid: %v, error: %v", args[0], args[1:], pid, err)
-				} else {
-					log.Fatalf("Failed to find process for pid: %v, error: %v", pid, err)
-				}
+			var opts []replayer.Opt
+			if multilineStart != "" {
+				opts = append(opts, replayer.OptMultilineStartPattern(multilineStart))
 			}
-			// Initialize cpu usage data
-			err = p.Update()
-			if err != nil {
-				log.Fatalf("Failed to initialize resource usage: %v", err)
+
+			if replayTimeLayout != "" {
+				opts = append(opts, replayer.OptTimeLayout(replayTimeLayout))
 			}
-			<-t.C
+
+			replayer.NewReplayer(rf, wf, opts...)
+		}
+		runTest(tLength, freq, pid, args)
+	} else {
+		var opts []generator.Opt
+		if timeLayout != "" {
+			opts = append(opts, generator.OptTimeLayout(timeLayout))
 		}
 
-		for n = 0; time.Now().Sub(start) < tLength; n++ {
-			if p != nil {
-				err = p.Update()
-				if err != nil {
-					log.Fatalf("Failed to update resource usage: %v", err)
-				}
-				cpu := p.CpuPercent()
-				fmt.Printf("CPU: %.1f%% MEM: %v \n", cpu, p.MemoryHuman())
-				scpu += cpu
-				mbf := float64(p.Memory())
-				sres += mbf
-				if mres < mbf {
-					mres = mbf
-				}
+		gens := generator.NewFixed(logLine, files, opts...)
+
+		for _, rate := range rates {
+			gens.SetRate(rate)
+			fmt.Printf("Ramping up for rate %v for %v ...\n", rate, rampUp)
+			time.Sleep(rampUp)
+			runTest(tLength, freq, pid, args)
+		}
+
+		fmt.Println("Stopping generators ...")
+		gens.Stop()
+	}
+}
+
+func runTest(tLength, freq time.Duration, pid int, args []string) {
+	start := time.Now()
+	t := time.NewTicker(freq)
+
+	var scpu, sres, mres float64
+	var n int
+	var p *resource.Process
+	if pid != noPid {
+		var err error
+		p, err = resource.FindProcess(pid)
+		if err != nil {
+			if len(args) > 0 {
+				log.Fatalf("Failed to find process for command %v with params %v, pid: %v, error: %v", args[0], args[1:], pid, err)
 			} else {
-				fmt.Printf(".")
+				log.Fatalf("Failed to find process for pid: %v, error: %v", pid, err)
 			}
-			<-t.C
 		}
-		fmt.Println()
-		t.Stop()
-		if pid != noPid && n > 0 {
-			fmt.Printf("In the past %v, average cpu usage: %.1f%%, average memory usage: %.1fM, maximium memory usage: %.1fM\n\n", tLength, scpu/float64(n), sres/float64(n)/1024/1024, mres/1024/1024)
+		// Initialize cpu usage data
+		err = p.Update()
+		if err != nil {
+			log.Fatalf("Failed to initialize resource usage: %v", err)
 		}
+		<-t.C
 	}
 
-	fmt.Println("Stopping generators ...")
-	gens.Stop()
-	if len(args) > 0 {
-		fmt.Println("Stopping the agent ...")
-		stopAgent(cmd)
+	for n = 0; time.Now().Sub(start) < tLength; n++ {
+		if p != nil {
+			err := p.Update()
+			if err != nil {
+				log.Fatalf("Failed to update resource usage: %v", err)
+			}
+			cpu := p.CpuPercent()
+			fmt.Printf("CPU: %.1f%% MEM: %v \n", cpu, p.MemoryHuman())
+			scpu += cpu
+			mbf := float64(p.Memory())
+			sres += mbf
+			if mres < mbf {
+				mres = mbf
+			}
+		} else {
+			fmt.Printf(".")
+		}
+		<-t.C
+	}
+	fmt.Println()
+	t.Stop()
+	if pid != noPid && n > 0 {
+		fmt.Printf("In the past %v, average cpu usage: %.1f%%, average memory usage: %.1fM, maximium memory usage: %.1fM\n\n", tLength, scpu/float64(n), sres/float64(n)/1024/1024, mres/1024/1024)
 	}
 }
 
