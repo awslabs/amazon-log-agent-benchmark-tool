@@ -68,7 +68,7 @@ func main() {
 	flag.IntVar(&pid, "p", noPid, "Pid of the agent to check resource usage")
 	flag.BoolVar(&pipeOutput, "o", false, "Pipe agent output to stdout and stderr")
 	flag.StringVar(&replay, "replay", "", "Path to a file for log replay")
-	flag.StringVar(&replayTimeLayout, "replaytimelayout", "", `Format to parse and replace the timestamp for replaying log file, e.g. -replayTimeLayout='Mon, 02 Jan 2006 15:04:05 MST', or use a capture group like -replaytimelayout='"timestamp":"(2006-01-02T15:04:05-0700)"' following Go time layout, see: https://golang.org/pkg/time/#pkg-constants`)
+	flag.StringVar(&replayTimeLayout, "replaytimelayout", "", `Format to parse and replace the timestamp for replaying log file, e.g. -replaytimelayout='Mon, 02 Jan 2006 15:04:05 MST', or use a capture group like -replaytimelayout='"timestamp":"(2006-01-02T15:04:05-0700)"' following Go time layout, see: https://golang.org/pkg/time/#pkg-constants`)
 	flag.StringVar(&multilineStart, "multilinestart", "", "Regular expression of a start of a multiline log event")
 	flag.StringVar(&timeLayout, "timelayout", "Jan _2 15:04:05.000000000", "Format to print the timestamp for the log lines, following Go time layout, see: https://golang.org/pkg/time/#pkg-constants")
 	flag.StringVar(&logLine, "line", FixedLogLine, "Content of the log line to be used")
